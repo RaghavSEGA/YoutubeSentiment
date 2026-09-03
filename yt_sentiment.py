@@ -291,16 +291,19 @@ def _parse_json_array(text: str):
     text = re.sub(r"```$", "", text).strip()
     return json.loads(text)
 
+SCORE_BATCH_MAX_ATTEMPTS = 3
+SCORE_BATCH_BACKOFF_BASE = 0.6  # seconds; doubles each retry (0.6s, 1.2s)
+
 def _score_batch(batch_items, topic_categories=None):
     """batch_items: list of (idx, text). Returns dict idx -> (score, label, topic).
-    Empty dict on failure."""
+    Empty dict on failure (after retries)."""
     topic_categories = _normalize_topic_categories(topic_categories)
     payload = json.dumps([
         {"id": i, "text": clean_for_sentiment(t)[:500]} for i, t in batch_items
     ])
     client = get_bedrock_client()
     system = _classification_system_prompt(topic_categories)
-    for attempt in range(2):  # one retry on transient/parse failures
+    for attempt in range(SCORE_BATCH_MAX_ATTEMPTS):
         try:
             resp = client.messages.create(
                 model=SENTIMENT_MODEL_ID,
@@ -323,6 +326,13 @@ def _score_batch(batch_items, topic_categories=None):
                 out[i] = (score, label, topic)
             return out
         except Exception:
+            # Running 6 batches concurrently makes transient Bedrock throttling
+            # more likely precisely because of the parallelism — an instant
+            # retry with no delay just hits the same throttle window again.
+            # Back off (0.6s, then 1.2s) before the next attempt so a real
+            # rate limit has a chance to clear.
+            if attempt < SCORE_BATCH_MAX_ATTEMPTS - 1:
+                time.sleep(SCORE_BATCH_BACKOFF_BASE * (2 ** attempt))
             continue
     return {}
 
@@ -676,6 +686,47 @@ def _bedrock_call(system, user, max_tokens=1200):
         messages=[{"role": "user", "content": user}],
     )
     return "".join(b.text for b in resp.content if b.type == "text")
+
+TOPIC_DISCOVERY_SAMPLE_SIZE = 400
+
+def discover_topic_categories(texts, max_categories: int = 6) -> list:
+    """One Bedrock call: look at a sample of the actual message text and
+    propose topic categories that describe what's really being discussed,
+    instead of relying on a hand-typed list. Falls back to
+    DEFAULT_TOPIC_CATEGORIES on any failure (empty input, bad response, API
+    error) so a failed discovery call never blocks the rest of the run —
+    scoring just proceeds with the generic defaults instead."""
+    non_empty = [str(t).strip() for t in texts if t and str(t).strip()]
+    if not non_empty:
+        return list(DEFAULT_TOPIC_CATEGORIES)
+
+    if len(non_empty) > TOPIC_DISCOVERY_SAMPLE_SIZE:
+        # Evenly spaced across the whole dataset rather than just the start,
+        # so a sample from early in a long stream doesn't dominate.
+        step = len(non_empty) / TOPIC_DISCOVERY_SAMPLE_SIZE
+        sample = [non_empty[int(i * step)] for i in range(TOPIC_DISCOVERY_SAMPLE_SIZE)]
+    else:
+        sample = non_empty
+
+    system = (
+        "You are analyzing a sample of YouTube live chat / comment messages to propose a "
+        "small set of topic categories that best describe what people are actually discussing "
+        "— grounded in this specific sample's content, not a generic list. "
+        f"Propose between 4 and {max_categories} categories. Keep each label short (1-3 words), "
+        "title case, and non-overlapping. Don't include a catch-all/'Other' category — that's "
+        "added automatically afterward for anything that doesn't fit. "
+        "Respond with ONLY a JSON array of strings, no prose, no markdown fences."
+    )
+    user = "Sample messages:\n" + "\n".join(f"- {t[:200]}" for t in sample)
+    try:
+        raw = _bedrock_call(system, user, max_tokens=300)
+        categories = _parse_json_array(raw)
+        categories = [str(c).strip() for c in categories if str(c).strip()]
+        if categories:
+            return categories[:max_categories]
+    except Exception:
+        pass
+    return list(DEFAULT_TOPIC_CATEGORIES)
 
 def _sample_for_ai(df: pd.DataFrame, cap: int = 1200) -> pd.DataFrame:
     """Keep the AI pass fast/cheap: use everything under the cap, otherwise a
@@ -1089,15 +1140,34 @@ with st.sidebar.expander("Sentiment scoring (Claude Haiku)", expanded=False):
     )
 
 with st.sidebar.expander("Topic categories", expanded=False):
-    st.caption("Same Haiku pass also tags each message with one of these topics, so it costs "
-               "no extra API calls. \"Other\" is always added automatically as a catch-all.")
-    topic_categories_input = st.text_input(
-        "Categories (comma-separated)",
-        value="Games, Characters, Features, Music, Requests",
+    st.caption("Every message also gets tagged with a topic. \"Other\" is always added "
+               "automatically as a catch-all for anything that doesn't fit.")
+    topic_mode = st.radio("How to choose categories", ["Type my own", "Auto-detect from data"],
+                           horizontal=True)
+    auto_detect_topics = topic_mode == "Auto-detect from data"
+    if auto_detect_topics:
+        st.caption(
+            "Claude looks at a sample of the fetched/uploaded text and proposes categories "
+            "before scoring starts — one extra Bedrock call. Trade-off: this run can't overlap "
+            "fetching with scoring (it needs to see the data first), so it'll be somewhat slower "
+            "than a manual-category run on the same dataset. Detected categories are shown after "
+            "the run so you can reuse them as a manual list next time if you want the speed back."
+        )
+        topic_categories_input = None
+    else:
+        topic_categories_input = st.text_input(
+            "Categories (comma-separated)",
+            value="Games, Characters, Features, Music, Requests",
+        )
+        st.caption("Same Haiku pass also tags each message with one of these, so it costs no "
+                   "extra API calls.")
+
+if auto_detect_topics:
+    topic_categories = None  # resolved per-run in load_data() from a sample of the actual data
+else:
+    topic_categories = _normalize_topic_categories(
+        [c.strip() for c in topic_categories_input.split(",") if c.strip()]
     )
-topic_categories = _normalize_topic_categories(
-    [c.strip() for c in topic_categories_input.split(",") if c.strip()]
-)
 
 run_ai_summary = st.sidebar.checkbox("Generate AI theme summary (Bedrock)", value=True)
 
@@ -1108,6 +1178,27 @@ run_clicked = st.sidebar.button("▶ Run Analysis", width='stretch')
 # Orchestration — build the working dataset
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _throttle(fn, min_interval=0.15):
+    """Wrap a progress callback so it actually touches the Streamlit UI at
+    most every `min_interval` seconds, no matter how often it's called.
+
+    Every widget update (st.progress/.text/...) costs real time — it builds
+    and pushes a delta to the frontend, not just a Python function call — so
+    firing one per message on a large fetch adds up: even in a lightweight
+    test harness, 5,000 raw placeholder updates took ~0.8s on their own, and
+    a real browser session over a websocket is typically slower. Since the
+    placeholder gets cleared right after the fetch/score loop finishes
+    either way, skipping intermediate updates between the throttle window is
+    harmless — the person just sees the counter tick up in ~150ms steps
+    instead of on every single item."""
+    state = {"last": 0.0}
+    def wrapped(*args, **kwargs):
+        now = time.time()
+        if now - state["last"] >= min_interval:
+            state["last"] = now
+            fn(*args, **kwargs)
+    return wrapped
+
 def _scoring_progress(label):
     progress = st.progress(0.0, text=f"Scoring {label} sentiment with Claude Haiku...")
     def cb(done, total):
@@ -1115,19 +1206,23 @@ def _scoring_progress(label):
                            text=f"Scoring {label} sentiment with Claude Haiku... ({done}/{total})")
         if done >= total:
             progress.empty()
-    return cb
+    return _throttle(cb)
 
 def load_data():
-    chat_df = pd.DataFrame()
-    comments_df = pd.DataFrame()
+    chat_items, comments_items = None, None
+    chat_scores, chat_failed = None, 0
+    comments_scores, comments_failed = None, 0
+    chat_df, comments_df = pd.DataFrame(), pd.DataFrame()
 
+    # ── Chat: fetch/load raw items. Scored inline (via StreamingScorer, overlapped
+    #    with fetching) unless auto-detect is on, in which case scoring is deferred
+    #    until categories are resolved from a sample below. ──────────────────────
     if need_chat:
         if source_mode == "Video ID (fetch live)":
             if not video_id:
                 st.error("Enter a video ID to fetch chat.")
                 st.stop()
             fetch_status = st.empty()
-            score_status_cb = _scoring_progress("chat")
             chat_cap = int(max_chat_messages) if cap_chat else None
             if cap_chat:
                 def cb(n):
@@ -1135,46 +1230,43 @@ def load_data():
             else:
                 def cb(n):
                     fetch_status.text(f"Fetched {n:,} chat messages so far...")
-            # Scoring runs concurrently with fetching via StreamingScorer — Haiku
-            # batches get submitted as soon as they fill, while the fetch loop
-            # keeps pulling more pages in the background thread pool's downtime.
-            scorer = StreamingScorer(status_cb=score_status_cb, topic_categories=topic_categories)
-            with st.spinner("Fetching live chat / replay (scoring runs alongside it)..."):
-                items = fetch_live_chat(video_id, chat_cap, int(chat_timeout_min) * 60,
-                                         progress_cb=cb, topchat_only=topchat_only, scorer=scorer)
-                scores, failed = scorer.finish()
+            cb = _throttle(cb)
+
+            if auto_detect_topics:
+                with st.spinner("Fetching live chat / replay..."):
+                    chat_items = fetch_live_chat(video_id, chat_cap, int(chat_timeout_min) * 60,
+                                                  progress_cb=cb, topchat_only=topchat_only)
+            else:
+                score_status_cb = _scoring_progress("chat")
+                # Scoring runs concurrently with fetching via StreamingScorer — Haiku
+                # batches get submitted as soon as they fill, while the fetch loop
+                # keeps pulling more pages in the background thread pool's downtime.
+                scorer = StreamingScorer(status_cb=score_status_cb, topic_categories=topic_categories)
+                with st.spinner("Fetching live chat / replay (scoring runs alongside it)..."):
+                    chat_items = fetch_live_chat(video_id, chat_cap, int(chat_timeout_min) * 60,
+                                                  progress_cb=cb, topchat_only=topchat_only, scorer=scorer)
+                    chat_scores, chat_failed = scorer.finish()
             fetch_status.empty()
-            if not items:
+            if not chat_items:
                 st.warning("No chat messages retrieved. Check the video ID and that chat/replay is enabled.")
-            if items:
-                chat_df = chat_to_dataframe(items, precomputed_scores=scores)
-                if failed:
-                    st.warning("Some chat message batches couldn't be scored and were marked Neutral "
-                                "(model call failed after a retry). Re-run if this seems off.")
         else:
             if not chat_upload:
                 st.error("Upload a chat JSON file.")
                 st.stop()
-            items = load_chat_json(chat_upload.read())
-            if cap_analyze and len(items) > max_analyze_items:
-                st.info(f"Chat JSON has {len(items):,} messages — analyzing the first {max_analyze_items:,} "
-                         f"(raise or disable the cap in the sidebar to analyze all of it).")
-                items = items[:max_analyze_items]
-            if items:
-                st.caption(f"Scoring sentiment on all {len(items):,} chat messages...")
-                with st.spinner("Scoring sentiment with Claude Haiku..."):
-                    chat_df = chat_to_dataframe(items, status_cb=_scoring_progress("chat"), topic_categories=topic_categories)
-                if st.session_state.pop("_sentiment_failed_batches", None):
-                    st.warning("Some chat message batches couldn't be scored and were marked Neutral "
-                                "(model call failed after a retry). Re-run if this seems off.")
+            chat_items = load_chat_json(chat_upload.read())
+            if cap_analyze and len(chat_items) > max_analyze_items:
+                st.info(f"Chat JSON has {len(chat_items):,} messages — analyzing the first "
+                         f"{max_analyze_items:,} (raise or disable the cap in the sidebar to "
+                         f"analyze all of it).")
+                chat_items = chat_items[:max_analyze_items]
 
+    # ── Comments: same pattern ──────────────────────────────────────────────────
     if need_comments:
         if source_mode == "Video ID (fetch live)":
             if not video_id:
                 st.error("Enter a video ID to fetch comments.")
                 st.stop()
             fetch_status2 = st.empty()
-            score_status_cb2 = _scoring_progress("comment")
             comments_cap = int(max_comments) if cap_comments else None
             if cap_comments:
                 def cb2(n):
@@ -1182,38 +1274,79 @@ def load_data():
             else:
                 def cb2(n):
                     fetch_status2.text(f"Fetched {n:,} comments so far...")
-            scorer2 = StreamingScorer(status_cb=score_status_cb2, topic_categories=topic_categories)
-            with st.spinner("Fetching comments (scoring runs alongside it)..."):
-                items = fetch_comments(video_id, comments_cap, comment_sort, progress_cb=cb2, scorer=scorer2)
-                scores2, failed2 = scorer2.finish()
+            cb2 = _throttle(cb2)
+
+            if auto_detect_topics:
+                with st.spinner("Fetching comments..."):
+                    comments_items = fetch_comments(video_id, comments_cap, comment_sort, progress_cb=cb2)
+            else:
+                score_status_cb2 = _scoring_progress("comment")
+                scorer2 = StreamingScorer(status_cb=score_status_cb2, topic_categories=topic_categories)
+                with st.spinner("Fetching comments (scoring runs alongside it)..."):
+                    comments_items = fetch_comments(video_id, comments_cap, comment_sort,
+                                                     progress_cb=cb2, scorer=scorer2)
+                    comments_scores, comments_failed = scorer2.finish()
             fetch_status2.empty()
-            if not items:
+            if not comments_items:
                 st.warning("No comments retrieved. Check the video ID and that comments are enabled.")
-            if items:
-                comments_df = comments_to_dataframe(items, precomputed_scores=scores2)
-                if failed2:
-                    st.warning("Some comment batches couldn't be scored and were marked Neutral "
-                                "(model call failed after a retry). Re-run if this seems off.")
         else:
             if not comments_upload:
                 st.error("Upload a comments JSON file.")
                 st.stop()
-            items = load_comments_json(comments_upload.read())
-            if cap_analyze and len(items) > max_analyze_items:
-                st.info(f"Comments JSON has {len(items):,} items — analyzing the first {max_analyze_items:,} "
-                         f"(raise or disable the cap in the sidebar to analyze all of it).")
-                items = items[:max_analyze_items]
-            if items:
-                st.caption(f"Scoring sentiment on all {len(items):,} comments...")
-                with st.spinner("Scoring sentiment with Claude Haiku..."):
-                    comments_df = comments_to_dataframe(items, status_cb=_scoring_progress("comment"), topic_categories=topic_categories)
-                if st.session_state.pop("_sentiment_failed_batches", None):
-                    st.warning("Some comment batches couldn't be scored and were marked Neutral "
-                                "(model call failed after a retry). Re-run if this seems off.")
+            comments_items = load_comments_json(comments_upload.read())
+            if cap_analyze and len(comments_items) > max_analyze_items:
+                st.info(f"Comments JSON has {len(comments_items):,} items — analyzing the first "
+                         f"{max_analyze_items:,} (raise or disable the cap in the sidebar to "
+                         f"analyze all of it).")
+                comments_items = comments_items[:max_analyze_items]
+
+    # ── Resolve topic categories. For auto-detect, this is where the extra
+    #    Bedrock call happens — on one combined sample across whichever sources
+    #    were fetched, so chat and comments share a single taxonomy instead of
+    #    getting two different ones for "Both" scope. ───────────────────────────
+    resolved_categories = topic_categories
+    if auto_detect_topics:
+        combined_texts = []
+        if chat_items:
+            combined_texts += [it.get("message") for it in chat_items]
+        if comments_items:
+            combined_texts += [it.get("text") for it in comments_items]
+        with st.spinner("Auto-detecting topic categories from a sample of the data..."):
+            resolved_categories = discover_topic_categories(combined_texts)
+        st.session_state["auto_detected_topics"] = resolved_categories
+        st.success(f"Auto-detected topics: {', '.join(resolved_categories)} (+ Other)")
+
+    # ── Score whatever wasn't already scored inline above ───────────────────────
+    if chat_items:
+        if chat_scores is not None:
+            chat_df = chat_to_dataframe(chat_items, precomputed_scores=chat_scores)
+        else:
+            st.caption(f"Scoring sentiment on all {len(chat_items):,} chat messages...")
+            with st.spinner("Scoring sentiment with Claude Haiku..."):
+                chat_df = chat_to_dataframe(chat_items, status_cb=_scoring_progress("chat"),
+                                             topic_categories=resolved_categories)
+            chat_failed = st.session_state.pop("_sentiment_failed_batches", 0)
+        if chat_failed:
+            st.warning("Some chat message batches couldn't be scored and were marked Neutral "
+                        "(model call failed after retries). Re-run if this seems off.")
+
+    if comments_items:
+        if comments_scores is not None:
+            comments_df = comments_to_dataframe(comments_items, precomputed_scores=comments_scores)
+        else:
+            st.caption(f"Scoring sentiment on all {len(comments_items):,} comments...")
+            with st.spinner("Scoring sentiment with Claude Haiku..."):
+                comments_df = comments_to_dataframe(comments_items, status_cb=_scoring_progress("comment"),
+                                                     topic_categories=resolved_categories)
+            comments_failed = st.session_state.pop("_sentiment_failed_batches", 0)
+        if comments_failed:
+            st.warning("Some comment batches couldn't be scored and were marked Neutral "
+                        "(model call failed after retries). Re-run if this seems off.")
 
     return chat_df, comments_df
 
 if run_clicked:
+    st.session_state["auto_detected_topics"] = None  # reset before load_data() may repopulate it
     chat_df, comments_df = load_data()
     st.session_state["chat_df"] = chat_df
     st.session_state["comments_df"] = comments_df
@@ -1341,6 +1474,12 @@ def render_topic_analysis_tab(df: pd.DataFrame, figs_for_report: dict):
     if "topic" not in df.columns:
         st.info("No topic data available for this dataset.")
         return
+
+    auto_detected = st.session_state.get("auto_detected_topics")
+    if auto_detected:
+        st.caption(f"🔍 Categories were auto-detected from this data: {', '.join(auto_detected)} "
+                   "(+ Other). Paste these into the sidebar's \"Type my own\" list to reuse them "
+                   "on a re-run with the fetch/score overlap back on.")
 
     topic_counts = df["topic"].value_counts().reset_index()
     topic_counts.columns = ["topic", "count"]
