@@ -1,0 +1,9 @@
+streamlit
+pandas
+plotly
+kaleido>=1.0.0
+pytchat
+youtube-comment-downloader
+boto3
+anthropic
+reportlab
