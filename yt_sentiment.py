@@ -600,6 +600,185 @@ def _describe_exception_chain(e, max_depth=3) -> str:
         current = nxt
     return " <- caused by ".join(parts)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Twitch GQL persisted-query hash overrides
+# ─────────────────────────────────────────────────────────────────────────────
+# chat-downloader's Twitch support depends on a handful of hardcoded GraphQL
+# "persisted query" hashes — Twitch's anti-abuse mechanism where a request
+# names a pre-registered query by its hash instead of sending query text.
+# Twitch periodically rotates/invalidates these, breaking every anonymous
+# third-party tool referencing the old hash until someone captures a current
+# one and patches it in. This has happened repeatedly, to multiple unrelated
+# tools, over several years — see e.g.
+#   https://github.com/ytdl-org/youtube-dl/issues/31683
+#   https://github.com/jybp/twitch-downloader/issues/6
+# It shows up here as `KeyError: 'data'` (Twitch returned a GraphQL
+# {"errors": [...]} response instead of {"data": ...}) — the library doesn't
+# distinguish "persisted query rejected" from a transient network hiccup, so
+# it just retries a few times and then gives up with a generic message.
+#
+# If VOD/clip fetches start failing this way for every single VOD (not just
+# one), that's the likely cause, and there's no code fix here that survives
+# Twitch's next rotation — someone has to capture the CURRENT hash from a
+# real browser session:
+#   1. Open a Twitch VOD page in Chrome/Firefox with DevTools open (Network tab).
+#   2. Filter requests to "gql.twitch.tv".
+#   3. Find the POST request whose body has "operationName":"VideoMetadata"
+#      (or whichever operation is failing — check the error message for the
+#      operation name if it's not VideoMetadata).
+#   4. Copy its current "sha256Hash" from extensions.persistedQuery.
+#   5. Paste it into secrets.toml as TWITCH_GQL_HASH_OVERRIDES (a small JSON
+#      object, e.g. {"VideoMetadata": "the-new-hash"}), or hardcode it below.
+# No need to touch the installed chat_downloader package itself either way.
+TWITCH_GQL_HASH_OVERRIDES = {
+    # "VideoMetadata": "paste-a-freshly-captured-hash-here",
+}
+
+def _apply_twitch_gql_hash_overrides():
+    overrides = dict(TWITCH_GQL_HASH_OVERRIDES)
+    try:
+        secret_overrides = st.secrets.get("TWITCH_GQL_HASH_OVERRIDES")
+        if secret_overrides:
+            overrides.update(json.loads(secret_overrides) if isinstance(secret_overrides, str)
+                              else secret_overrides)
+    except Exception:
+        pass
+    if not overrides:
+        return
+    try:
+        from chat_downloader.sites.twitch import TwitchChatDownloader
+        TwitchChatDownloader._OPERATION_HASHES.update(overrides)
+    except Exception:
+        pass  # if chat-downloader's internals change shape, don't let this break the app
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Twitch VOD chat replay — via the actively-maintained `twitch-archiver`
+# package instead of chat-downloader
+# ─────────────────────────────────────────────────────────────────────────────
+# chat-downloader's hardcoded VideoMetadata persisted-query hash started
+# getting rejected by Twitch (see TWITCH_GQL_HASH_OVERRIDES above — the whole
+# VOD-replay path fails identically for every VOD with a KeyError on the very
+# first metadata lookup, before it ever gets to fetching chat). twitch-archiver
+# ships a newer hash for that same query and is actively maintained (frequent
+# releases), so it's meaningfully less likely to be stale — and its own GQL
+# wrapper explicitly checks for a GraphQL {"errors": [...]} response and
+# retries/raises a clean error, instead of blindly indexing into ['data'] and
+# crashing with a raw KeyError the way chat-downloader's does. Only used for
+# VOD replay; live chat and clips still go through chat-downloader (clips
+# aren't supported by twitch-archiver at all, and live chat's IRC path was
+# never affected by this issue in the first place).
+
+def _parse_rfc3339(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def _format_offset_seconds(secs):
+    try:
+        secs = int(secs)
+    except (TypeError, ValueError):
+        return None
+    h, rem = divmod(abs(secs), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+def _normalize_archiver_comment(c: dict) -> dict:
+    """Map a raw Twitch GQL VOD-comment dict (as collected by twitch-archiver's
+    Chat downloader) onto the same chat item schema used everywhere else in
+    this app, so chat_to_dataframe() works completely unchanged."""
+    commenter = c.get("commenter") or {}
+    message = c.get("message") or {}
+    fragments = message.get("fragments") or []
+    text = "".join(f.get("text", "") for f in fragments if isinstance(f, dict))
+    badges = message.get("userBadges") or []
+    badge_ids = {b.get("setID") for b in badges if isinstance(b, dict) and b.get("setID")}
+
+    dt = _parse_rfc3339(c.get("createdAt")) or datetime.now(timezone.utc)
+    offset = c.get("contentOffsetSeconds")
+
+    return {
+        "datetime": dt.isoformat(),
+        "elapsed_time": _format_offset_seconds(offset),
+        "author_name": commenter.get("displayName") or commenter.get("login") or "Unknown",
+        "author_channel_id": commenter.get("id"),
+        "is_chat_owner": "broadcaster" in badge_ids,
+        "is_chat_moderator": "moderator" in badge_ids,
+        "is_chat_sponsor": ("subscriber" in badge_ids) or ("founder" in badge_ids),
+        "message": text,
+        "message_id": c.get("id") or f"{offset}-{commenter.get('id')}",
+    }
+
+def fetch_twitch_vod_chat_via_archiver(vod_id, max_messages=None, progress_cb=None, scorer=None):
+    """Fetch Twitch VOD chat replay via twitch-archiver's Vod/Chat classes,
+    used as a library (not via its CLI — no ffmpeg needed for chat-only use).
+
+    Unlike fetch_twitch_chat(), this does one full blocking fetch of the
+    entire VOD's chat log — twitch-archiver's Chat downloader doesn't expose
+    an incremental/streaming interface — so max_messages is applied by
+    truncating afterward rather than stopping the fetch early, and there's no
+    fetch/score overlap for this path. That's a real trade-off against the
+    chat-downloader path, accepted here because getting any data beats a
+    guaranteed KeyError crash."""
+    import tempfile
+    from twitcharchiver.vod import Vod
+    from twitcharchiver.downloaders.chat import Chat as ArchiverChat
+    from twitcharchiver.exceptions import TwitchAPIErrorNotFound, TwitchAPIErrorForbidden
+
+    try:
+        vod = Vod(vod_id=int(vod_id))
+    except (TwitchAPIErrorNotFound, TwitchAPIErrorForbidden):
+        raise TwitchChatError("That Twitch VOD ID doesn't exist or is unavailable.")
+    except ValueError:
+        raise TwitchChatError(f"'{vod_id}' doesn't look like a valid numeric Twitch VOD ID.")
+    except Exception as e:
+        raise TwitchChatError(f"Couldn't look up that Twitch VOD: {_describe_exception_chain(e)}")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        chat = ArchiverChat(vod, parent_dir=Path(tmpdir), quiet=True)
+        try:
+            chat.start()
+        except Exception as e:
+            raise TwitchChatError(f"Couldn't fetch Twitch VOD chat: {_describe_exception_chain(e)}")
+        raw_log = list(chat._chat_log)  # no public accessor exists for the collected messages
+
+    if not raw_log:
+        raise TwitchChatError(
+            "No chat messages were found for that VOD — it may not have chat replay available."
+        )
+
+    if max_messages is not None:
+        raw_log = raw_log[:max_messages]
+
+    items = []
+    for c in raw_log:
+        item = _normalize_archiver_comment(c)
+        items.append(item)
+        if scorer is not None:
+            scorer.feed(item["message"])
+        if progress_cb:
+            progress_cb(len(items))
+    return items
+
+def _classify_twitch_url(url: str):
+    """Returns ('vod', id) / ('clip', id) / ('live', channel_name_or_url)
+    based on which URL shape chat-downloader's own Twitch URL patterns match
+    — reusing its patterns rather than writing new ones keeps our routing
+    consistent with what chat-downloader itself would have done."""
+    from chat_downloader.sites.twitch import TwitchChatDownloader
+    for method_name, pattern in TwitchChatDownloader._VALID_URLS.items():
+        m = re.match(pattern, url, re.IGNORECASE)
+        if m:
+            if method_name == "_get_chat_by_vod_id":
+                return "vod", m.group("id")
+            if method_name == "_get_chat_by_clip_id":
+                return "clip", m.group("id")
+            if method_name == "_get_chat_by_stream_id":
+                return "live", url
+    return "live", url  # bare channel name typed with no URL at all
+
 def fetch_twitch_chat(url: str, max_messages=None, max_seconds=None, progress_cb=None, scorer=None):
     """Fetch Twitch chat — live tail or VOD chat replay, auto-detected from the
     URL by chat-downloader — and normalize it into the same chat item schema
@@ -622,6 +801,7 @@ def fetch_twitch_chat(url: str, max_messages=None, max_seconds=None, progress_cb
     from chat_downloader import ChatDownloader
     from chat_downloader.errors import NoChatReplay, VideoUnavailable, UserNotFound
 
+    _apply_twitch_gql_hash_overrides()
     downloader = ChatDownloader()
     try:
         # interruptible_retry=False: chat-downloader's default retry behavior
@@ -1417,13 +1597,17 @@ def _scoring_progress(label):
     return _throttle(cb)
 
 def _fetch_chat_source(platform, identifier, cap, timeout_seconds, progress_cb, topchat_only, scorer=None):
-    """Dispatch to the right chat fetcher for the selected platform. Both
-    return the same item schema, so everything downstream (chat_to_dataframe,
-    StreamingScorer, etc.) is completely platform-agnostic."""
+    """Dispatch to the right chat fetcher for the selected platform. All
+    paths return the same item schema, so everything downstream
+    (chat_to_dataframe, StreamingScorer, etc.) is completely source-agnostic."""
     if platform == "YouTube":
         return fetch_live_chat(identifier, cap, timeout_seconds, progress_cb=progress_cb,
                                 topchat_only=topchat_only, scorer=scorer)
     try:
+        kind, value = _classify_twitch_url(identifier)
+        if kind == "vod":
+            return fetch_twitch_vod_chat_via_archiver(value, max_messages=cap,
+                                                       progress_cb=progress_cb, scorer=scorer)
         return fetch_twitch_chat(identifier, cap, timeout_seconds, progress_cb=progress_cb, scorer=scorer)
     except TwitchChatError as e:
         st.error(str(e))
