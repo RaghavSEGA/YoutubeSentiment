@@ -4,6 +4,7 @@ plotly
 kaleido>=1.0.0
 pytchat
 youtube-comment-downloader
+chat-downloader
 boto3
 anthropic
 reportlab
