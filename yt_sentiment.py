@@ -582,6 +582,24 @@ def _normalize_twitch_message(msg: dict) -> dict:
         "message_id": msg.get("message_id") or f"{ts_micros}-{author.get('id')}",
     }
 
+def _describe_exception_chain(e, max_depth=3) -> str:
+    """Walk __cause__/__context__ to surface the real underlying error instead
+    of just chat-downloader's generic wrapper message (e.g. 'Maximum number
+    of retries has been reached (3)', which by itself doesn't say what
+    actually failed on the underlying request — the real reason is usually
+    one level down, in the exception that triggered the retries)."""
+    parts = [f"{type(e).__name__}: {e}"]
+    seen = {id(e)}
+    current = e
+    for _ in range(max_depth):
+        nxt = current.__cause__ or current.__context__
+        if nxt is None or id(nxt) in seen:
+            break
+        parts.append(f"{type(nxt).__name__}: {nxt}")
+        seen.add(id(nxt))
+        current = nxt
+    return " <- caused by ".join(parts)
+
 def fetch_twitch_chat(url: str, max_messages=None, max_seconds=None, progress_cb=None, scorer=None):
     """Fetch Twitch chat — live tail or VOD chat replay, auto-detected from the
     URL by chat-downloader — and normalize it into the same chat item schema
@@ -644,8 +662,10 @@ def fetch_twitch_chat(url: str, max_messages=None, max_seconds=None, progress_cb
     except Exception as e:
         # Anything else (network error, Twitch-side API/schema change, retries
         # exhausted, etc.) — surface it as a clean message instead of letting
-        # an unrelated internal exception crash the whole app.
-        raise TwitchChatError(f"Couldn't fetch Twitch chat for that URL: {e}")
+        # an unrelated internal exception crash the whole app. The chain walk
+        # matters here specifically: chat-downloader's own retry-exhausted
+        # error message is generic and doesn't include what actually failed.
+        raise TwitchChatError(f"Couldn't fetch Twitch chat for that URL: {_describe_exception_chain(e)}")
 
     is_live_status = getattr(chat, "status", None) in ("live", "upcoming")
     if max_seconds is not None:
@@ -679,7 +699,7 @@ def fetch_twitch_chat(url: str, max_messages=None, max_seconds=None, progress_cb
         # discarding a partial (and possibly large) fetch over a late-surfacing error
     except Exception as e:
         if not items:
-            raise TwitchChatError(f"Twitch chat fetch was interrupted: {e}")
+            raise TwitchChatError(f"Twitch chat fetch was interrupted: {_describe_exception_chain(e)}")
         # keep whatever was collected before a late/mid-stream failure rather
         # than discarding a partial (and possibly large) fetch
     return items
