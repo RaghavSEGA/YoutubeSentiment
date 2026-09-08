@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YouTube Sentiment Dashboard
+Stream Sentiment Dashboard
 Analyzes sentiment of YouTube live chat replay and/or video comments.
 
 Auth:      @segaamerica.com OTP via AWS SES -> HMAC-signed URL token (?t=)
@@ -21,6 +21,7 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -50,7 +51,7 @@ SENTIMENT_MAX_WORKERS = 6   # concurrent scoring calls
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="YouTube Sentiment Dashboard",
+    page_title="Stream Sentiment Dashboard",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -153,7 +154,7 @@ def send_otp_email(email: str, otp: str):
         Source=st.secrets["EMAIL_FROM"],
         Destination={"ToAddresses": [email]},
         Message={
-            "Subject": {"Data": "Your YouTube Sentiment Dashboard code"},
+            "Subject": {"Data": "Your Stream Sentiment Dashboard code"},
             "Body": {
                 "Text": {
                     "Data": f"Your one-time verification code is: {otp}\n\n"
@@ -175,7 +176,7 @@ def login_gate():
     if st.session_state.get("auth_email"):
         return
 
-    st.markdown("## 📊 YouTube Sentiment Dashboard")
+    st.markdown("## 📊 Stream Sentiment Dashboard")
     st.caption("Sign in with your Sega America email to continue.")
 
     step = st.session_state.get("auth_step", "email")
@@ -537,6 +538,122 @@ def fetch_live_chat(video_id: str, max_messages=None, max_seconds=None, progress
 
     return items
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Data ingestion — Twitch chat, live tail or VOD replay (chat-downloader)
+# ─────────────────────────────────────────────────────────────────────────────
+
+TWITCH_LIVE_HARD_TIMEOUT = 3600  # seconds; safety ceiling for an uncapped live tail
+
+class TwitchChatError(Exception):
+    """Raised with a clear, user-facing message for known Twitch failure modes
+    (no chat replay available, invalid channel/VOD, etc.) instead of letting a
+    library-internal exception surface as a raw traceback."""
+    pass
+
+def _normalize_twitch_message(msg: dict) -> dict:
+    """Map a chat-downloader message dict (live IRC tags or VOD/GQL comment —
+    the two paths expose author status slightly differently) onto the same
+    chat item schema fetch_live_chat() produces, so chat_to_dataframe() works
+    on Twitch data completely unchanged."""
+    author = msg.get("author") or {}
+    badges = author.get("badges") or []
+    badge_names = {b.get("name") for b in badges if isinstance(b, dict) and b.get("name")}
+
+    is_owner = "broadcaster" in badge_names
+    is_moderator = bool(author.get("is_moderator")) or "moderator" in badge_names
+    is_sponsor = (bool(author.get("is_subscriber")) or "subscriber" in badge_names
+                  or "founder" in badge_names)
+
+    ts_micros = msg.get("timestamp")
+    if ts_micros:
+        dt = datetime.fromtimestamp(ts_micros / 1_000_000, tz=timezone.utc)
+    else:
+        dt = datetime.now(timezone.utc)
+
+    return {
+        "datetime": dt.isoformat(),
+        "elapsed_time": msg.get("time_text"),
+        "author_name": author.get("display_name") or author.get("name") or "Unknown",
+        "author_channel_id": author.get("id"),
+        "is_chat_owner": is_owner,
+        "is_chat_moderator": is_moderator,
+        "is_chat_sponsor": is_sponsor,
+        "message": msg.get("message") or "",
+        "message_id": msg.get("message_id") or f"{ts_micros}-{author.get('id')}",
+    }
+
+def fetch_twitch_chat(url: str, max_messages=None, max_seconds=None, progress_cb=None, scorer=None):
+    """Fetch Twitch chat — live tail or VOD chat replay, auto-detected from the
+    URL by chat-downloader — and normalize it into the same chat item schema
+    used everywhere else in this app.
+
+    A live channel URL (twitch.tv/channelname) tails chat in real time via
+    Twitch's anonymous IRC protocol (no token or app registration needed for
+    read-only access). A VOD URL (twitch.tv/videos/12345) or clip URL instead
+    pages through the archived chat replay via the same internal GQL endpoint
+    the twitch.tv website itself uses — same idea as pytchat's approach to
+    YouTube. Both come back through the same generator, so this one function
+    covers both cases; chat-downloader tells them apart from the URL alone.
+
+    max_messages/max_seconds are optional caps (None = uncapped), mirroring
+    fetch_live_chat(). The wall-clock deadline is only enforced when needed:
+    a VOD/clip replay ends on its own once the archive is exhausted, so it
+    stays fully uncapped unless the caller explicitly passes max_seconds — a
+    hard ceiling (TWITCH_LIVE_HARD_TIMEOUT) only kicks in automatically for a
+    genuinely live/upcoming channel, which otherwise has no natural end."""
+    from chat_downloader import ChatDownloader
+    from chat_downloader.errors import NoChatReplay, VideoUnavailable, UserNotFound
+
+    downloader = ChatDownloader()
+    try:
+        # No `timeout=` passed here deliberately — that would make
+        # chat-downloader apply one wall-clock deadline uniformly to both live
+        # and VOD fetches. We want to know chat.status first (below) so a
+        # finite VOD replay isn't cut off by a ceiling meant for endless live
+        # streams; timeout is enforced by hand in the loop instead.
+        chat = downloader.get_chat(url, max_messages=max_messages, message_receive_timeout=1.0)
+    except NoChatReplay:
+        raise TwitchChatError(
+            "This Twitch VOD/clip doesn't have chat replay available (it may have expired, "
+            "or the streamer disabled it)."
+        )
+    except UserNotFound:
+        raise TwitchChatError("No Twitch channel found for that name — double check it's correct.")
+    except VideoUnavailable:
+        raise TwitchChatError("That Twitch VOD/clip ID doesn't exist or is unavailable.")
+
+    is_live_status = getattr(chat, "status", None) in ("live", "upcoming")
+    if max_seconds is not None:
+        deadline = time.time() + max_seconds
+    elif is_live_status:
+        deadline = time.time() + TWITCH_LIVE_HARD_TIMEOUT
+    else:
+        deadline = None  # finite VOD/clip replay — let it run to completion
+
+    items = []
+    try:
+        for msg in chat:
+            if deadline is not None and time.time() >= deadline:
+                break
+            item = _normalize_twitch_message(msg)
+            items.append(item)
+            if scorer is not None:
+                scorer.feed(item["message"])
+            if progress_cb:
+                progress_cb(len(items))
+            if max_messages is not None and len(items) >= max_messages:
+                break
+    except (NoChatReplay, VideoUnavailable, UserNotFound):
+        # can also surface mid-iteration depending on how the library resolves the URL
+        if not items:
+            raise TwitchChatError(
+                "Twitch chat couldn't be retrieved for that channel/VOD — it may not exist, "
+                "or chat replay isn't available for it."
+            )
+        # if we already collected some messages before the error, keep them rather than
+        # discarding a partial (and possibly large) fetch over a late-surfacing error
+    return items
+
 def load_chat_json(raw_bytes) -> list:
     """Accepts the JSON structure produced by the user's download script (nested 'author')
     as well as a flat structure, and normalizes to the flat schema fetch_live_chat() produces."""
@@ -549,8 +666,12 @@ def load_chat_json(raw_bytes) -> list:
                 break
     out = []
     for c in data:
-        author = c.get("author", {})
-        if isinstance(author, dict):
+        # No default here (None, not {}) so a flat-schema item that simply has no
+        # "author" key at all falls through to the flat branch below, instead of
+        # matching isinstance(author, dict) on an empty dict and silently losing
+        # author_channel_id / owner / moderator / sponsor flags to it.
+        author = c.get("author")
+        if isinstance(author, dict) and author:
             out.append({
                 "datetime": c.get("datetime"),
                 "elapsed_time": c.get("elapsed_time") or c.get("elapsedTime"),
@@ -689,13 +810,14 @@ def _bedrock_call(system, user, max_tokens=1200):
 
 TOPIC_DISCOVERY_SAMPLE_SIZE = 400
 
-def discover_topic_categories(texts, max_categories: int = 6) -> list:
+def discover_topic_categories(texts, min_categories: int = 4, max_categories: int = 6) -> list:
     """One Bedrock call: look at a sample of the actual message text and
     propose topic categories that describe what's really being discussed,
     instead of relying on a hand-typed list. Falls back to
     DEFAULT_TOPIC_CATEGORIES on any failure (empty input, bad response, API
     error) so a failed discovery call never blocks the rest of the run —
     scoring just proceeds with the generic defaults instead."""
+    min_categories = max(1, min(min_categories, max_categories))
     non_empty = [str(t).strip() for t in texts if t and str(t).strip()]
     if not non_empty:
         return list(DEFAULT_TOPIC_CATEGORIES)
@@ -712,9 +834,11 @@ def discover_topic_categories(texts, max_categories: int = 6) -> list:
         "You are analyzing a sample of YouTube live chat / comment messages to propose a "
         "small set of topic categories that best describe what people are actually discussing "
         "— grounded in this specific sample's content, not a generic list. "
-        f"Propose between 4 and {max_categories} categories. Keep each label short (1-3 words), "
-        "title case, and non-overlapping. Don't include a catch-all/'Other' category — that's "
-        "added automatically afterward for anything that doesn't fit. "
+        f"Propose between {min_categories} and {max_categories} categories — use the low end if "
+        "the content is genuinely narrow, and don't pad the list with weak/overlapping categories "
+        "just to hit the upper bound. Keep each label short (1-3 words), title case, and "
+        "non-overlapping. Don't include a catch-all/'Other' category — that's added automatically "
+        "afterward for anything that doesn't fit. "
         "Respond with ONLY a JSON array of strings, no prose, no markdown fences."
     )
     user = "Sample messages:\n" + "\n".join(f"- {t[:200]}" for t in sample)
@@ -1075,17 +1199,28 @@ def build_pdf_report(meta: dict, df: pd.DataFrame, ai_summary: str, figs: dict) 
 # Sidebar — configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.sidebar.markdown("### 📊 YouTube Sentiment Dashboard")
+st.sidebar.markdown("### 📊 Stream Sentiment Dashboard")
 st.sidebar.caption(f"Signed in as {st.session_state.get('auth_email', '')}")
 st.sidebar.divider()
 
-scope = st.sidebar.radio(
-    "Analyze",
-    ["Chat only", "Comments only", "Both"],
-    help="Live chat / replay uses pytchat. Comments use youtube-comment-downloader.",
-)
-need_chat = scope in ("Chat only", "Both")
-need_comments = scope in ("Comments only", "Both")
+platform = st.sidebar.radio("Platform", ["YouTube", "Twitch"], horizontal=True)
+st.sidebar.divider()
+
+if platform == "YouTube":
+    scope = st.sidebar.radio(
+        "Analyze",
+        ["Chat only", "Comments only", "Both"],
+        help="Live chat / replay uses pytchat. Comments use youtube-comment-downloader.",
+    )
+    need_chat = scope in ("Chat only", "Both")
+    need_comments = scope in ("Comments only", "Both")
+else:
+    # Twitch has no separate "comments" section the way YouTube videos do —
+    # it's chat (live tail or VOD/clip replay) only.
+    scope = "Chat only"
+    need_chat = True
+    need_comments = False
+    st.sidebar.caption("Twitch: chat only — there's no separate comments section to analyze.")
 
 st.sidebar.divider()
 st.sidebar.markdown("#### Data source")
@@ -1096,32 +1231,50 @@ chat_upload = None
 comments_upload = None
 
 if source_mode == "Video ID (fetch live)":
-    video_id = st.sidebar.text_input("YouTube Video ID", placeholder="e.g. eVq6qlu0_GU")
+    if platform == "YouTube":
+        video_id = st.sidebar.text_input("YouTube Video ID", placeholder="e.g. eVq6qlu0_GU")
+    else:
+        video_id = st.sidebar.text_input(
+            "Twitch channel or VOD/clip URL",
+            placeholder="twitch.tv/somechannel  or  twitch.tv/videos/123456789",
+            help="A channel name or channel URL tails live chat in real time. A "
+                 "twitch.tv/videos/<id> or clips.twitch.tv URL instead fetches archived "
+                 "VOD/clip chat replay — auto-detected from what you paste.",
+        )
+
     with st.sidebar.expander("Fetch limits (optional)", expanded=False):
         st.caption("Off by default — every message/comment is fetched. Only turn these on "
                    "if you want to bound a very large or currently-live stream.")
-        comment_sort = st.selectbox("Comment sort", ["Popular", "Recent"])
+
+        if platform == "YouTube":
+            comment_sort = st.selectbox("Comment sort", ["Popular", "Recent"])
+        else:
+            comment_sort = None
 
         cap_chat = st.checkbox("Cap chat message count", value=False)
         max_chat_messages = st.number_input("Max chat messages", 100, 500000, 3000, step=100,
                                              disabled=not cap_chat)
         chat_timeout_min = st.number_input(
             "Chat safety timeout (minutes)", 1, 720, 60,
-            help="Only matters for a currently-live stream, which polls forever until it ends. "
-                 "An archived VOD replay finishes on its own regardless of this.",
+            help=("Only matters for a currently-live stream/channel, which polls forever until "
+                  "it ends. An archived VOD/replay finishes on its own regardless of this."),
         )
 
-        cap_comments = st.checkbox("Cap comment count", value=False)
-        max_comments = st.number_input("Max comments", 50, 500000, 1000, step=50,
-                                        disabled=not cap_comments)
-
-        st.divider()
-        topchat_only = st.checkbox(
-            "Top chat only (faster, less complete)", value=False,
-            help="Native pytchat option that returns only YouTube's highlighted 'top chat' "
-                 "messages instead of every message — meaningfully fewer network round-trips "
-                 "on very high-traffic streams, at the cost of completeness.",
-        )
+        if platform == "YouTube":
+            cap_comments = st.checkbox("Cap comment count", value=False)
+            max_comments = st.number_input("Max comments", 50, 500000, 1000, step=50,
+                                            disabled=not cap_comments)
+            st.divider()
+            topchat_only = st.checkbox(
+                "Top chat only (faster, less complete)", value=False,
+                help="Native pytchat option that returns only YouTube's highlighted 'top chat' "
+                     "messages instead of every message — meaningfully fewer network round-trips "
+                     "on very high-traffic streams, at the cost of completeness.",
+            )
+        else:
+            cap_comments = False
+            max_comments = None
+            topchat_only = False
 else:
     if need_chat:
         chat_upload = st.sidebar.file_uploader("Chat JSON", type=["json"], key="chat_json")
@@ -1152,6 +1305,11 @@ with st.sidebar.expander("Topic categories", expanded=False):
             "fetching with scoring (it needs to see the data first), so it'll be somewhat slower "
             "than a manual-category run on the same dataset. Detected categories are shown after "
             "the run so you can reuse them as a manual list next time if you want the speed back."
+        )
+        topic_category_range = st.slider(
+            "How many categories to detect", min_value=2, max_value=12, value=(4, 6),
+            help="Claude proposes a category count in this range — it'll use the low end if the "
+                 "content is genuinely narrow rather than padding the list to hit the top end.",
         )
         topic_categories_input = None
     else:
@@ -1208,6 +1366,19 @@ def _scoring_progress(label):
             progress.empty()
     return _throttle(cb)
 
+def _fetch_chat_source(platform, identifier, cap, timeout_seconds, progress_cb, topchat_only, scorer=None):
+    """Dispatch to the right chat fetcher for the selected platform. Both
+    return the same item schema, so everything downstream (chat_to_dataframe,
+    StreamingScorer, etc.) is completely platform-agnostic."""
+    if platform == "YouTube":
+        return fetch_live_chat(identifier, cap, timeout_seconds, progress_cb=progress_cb,
+                                topchat_only=topchat_only, scorer=scorer)
+    try:
+        return fetch_twitch_chat(identifier, cap, timeout_seconds, progress_cb=progress_cb, scorer=scorer)
+    except TwitchChatError as e:
+        st.error(str(e))
+        st.stop()
+
 def load_data():
     chat_items, comments_items = None, None
     chat_scores, chat_failed = None, 0
@@ -1220,7 +1391,8 @@ def load_data():
     if need_chat:
         if source_mode == "Video ID (fetch live)":
             if not video_id:
-                st.error("Enter a video ID to fetch chat.")
+                st.error("Enter a video ID to fetch chat." if platform == "YouTube"
+                          else "Enter a Twitch channel name or VOD/clip URL to fetch chat.")
                 st.stop()
             fetch_status = st.empty()
             chat_cap = int(max_chat_messages) if cap_chat else None
@@ -1234,8 +1406,8 @@ def load_data():
 
             if auto_detect_topics:
                 with st.spinner("Fetching live chat / replay..."):
-                    chat_items = fetch_live_chat(video_id, chat_cap, int(chat_timeout_min) * 60,
-                                                  progress_cb=cb, topchat_only=topchat_only)
+                    chat_items = _fetch_chat_source(platform, video_id, chat_cap,
+                                                     int(chat_timeout_min) * 60, cb, topchat_only)
             else:
                 score_status_cb = _scoring_progress("chat")
                 # Scoring runs concurrently with fetching via StreamingScorer — Haiku
@@ -1243,12 +1415,16 @@ def load_data():
                 # keeps pulling more pages in the background thread pool's downtime.
                 scorer = StreamingScorer(status_cb=score_status_cb, topic_categories=topic_categories)
                 with st.spinner("Fetching live chat / replay (scoring runs alongside it)..."):
-                    chat_items = fetch_live_chat(video_id, chat_cap, int(chat_timeout_min) * 60,
-                                                  progress_cb=cb, topchat_only=topchat_only, scorer=scorer)
+                    chat_items = _fetch_chat_source(platform, video_id, chat_cap,
+                                                     int(chat_timeout_min) * 60, cb, topchat_only,
+                                                     scorer=scorer)
                     chat_scores, chat_failed = scorer.finish()
             fetch_status.empty()
             if not chat_items:
-                st.warning("No chat messages retrieved. Check the video ID and that chat/replay is enabled.")
+                st.warning("No chat messages retrieved. Check the video ID and that chat/replay is enabled."
+                            if platform == "YouTube" else
+                            "No chat messages retrieved. Check the channel/VOD URL and that chat replay "
+                            "is available.")
         else:
             if not chat_upload:
                 st.error("Upload a chat JSON file.")
@@ -1312,7 +1488,11 @@ def load_data():
         if comments_items:
             combined_texts += [it.get("text") for it in comments_items]
         with st.spinner("Auto-detecting topic categories from a sample of the data..."):
-            resolved_categories = discover_topic_categories(combined_texts)
+            resolved_categories = discover_topic_categories(
+                combined_texts,
+                min_categories=topic_category_range[0],
+                max_categories=topic_category_range[1],
+            )
         st.session_state["auto_detected_topics"] = resolved_categories
         st.success(f"Auto-detected topics: {', '.join(resolved_categories)} (+ Other)")
 
@@ -1345,19 +1525,71 @@ def load_data():
 
     return chat_df, comments_df
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Bundled default dataset — lets the app open with the team's primary dataset
+# already loaded instead of an empty state, and skips re-running (slow,
+# costly) analysis on a 77k-message dataset that's already been scored once.
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_DATASET_PATH = Path(__file__).resolve().parent / "default_dataset.csv"
+DEFAULT_DATASET_LABEL = "Default dataset (bundled)"
+
+@st.cache_data(show_spinner=False)
+def load_bundled_default_dataset():
+    """Load the pre-scored CSV bundled alongside this script — same schema as
+    the app's own CSV export (source/text/author/timestamp/sentiment_score/
+    sentiment_label/topic/badge). Returns (chat_df, comments_df); both come
+    back empty if the file is missing or fails to parse, so a bad/missing
+    bundle never blocks the app — it just falls back to the normal empty
+    state where you configure a source yourself."""
+    if not DEFAULT_DATASET_PATH.exists():
+        return pd.DataFrame(), pd.DataFrame()
+    try:
+        df = pd.read_csv(DEFAULT_DATASET_PATH)
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
+    df["text"] = df.get("text", pd.Series(dtype=str)).fillna("")
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    source_col = df["source"] if "source" in df.columns else pd.Series(["Chat"] * len(df))
+    chat_df = df[source_col == "Chat"].reset_index(drop=True)
+    comments_df = df[source_col == "Comment"].reset_index(drop=True)
+    return chat_df, comments_df
+
 if run_clicked:
     st.session_state["auto_detected_topics"] = None  # reset before load_data() may repopulate it
     chat_df, comments_df = load_data()
     st.session_state["chat_df"] = chat_df
     st.session_state["comments_df"] = comments_df
     st.session_state["scope"] = scope
+    st.session_state["platform"] = platform
     st.session_state["video_id"] = video_id or "(uploaded JSON)"
     st.session_state["ai_summary"] = None  # reset any prior summary
     st.session_state["chat_messages"] = []  # reset chat-with-data history for the new dataset
     st.session_state["chat_display"] = []
     st.session_state["segment_ai_titles"] = None  # reset any prior AI segment titles
     st.session_state["segment_ai_titles_freq"] = None
+    st.session_state["is_default_dataset"] = False
     st.session_state["data_loaded"] = True
+elif "data_loaded" not in st.session_state:
+    # First time this session has rendered at all — try the bundled default
+    # dataset instead of showing an empty "configure a source" screen. Only
+    # runs once per session: after this, data_loaded is always set, so later
+    # reruns (widget interactions, a real Run Analysis) never touch this again.
+    default_chat_df, default_comments_df = load_bundled_default_dataset()
+    if not default_chat_df.empty or not default_comments_df.empty:
+        st.session_state["chat_df"] = default_chat_df
+        st.session_state["comments_df"] = default_comments_df
+        if not default_chat_df.empty and not default_comments_df.empty:
+            st.session_state["scope"] = "Both"
+        elif not default_chat_df.empty:
+            st.session_state["scope"] = "Chat only"
+        else:
+            st.session_state["scope"] = "Comments only"
+        st.session_state["video_id"] = DEFAULT_DATASET_LABEL
+        st.session_state["platform"] = "YouTube"
+        st.session_state["is_default_dataset"] = True
+        st.session_state["data_loaded"] = True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Dashboard
@@ -1532,7 +1764,16 @@ def render_topic_analysis_tab(df: pd.DataFrame, figs_for_report: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _bucket_topics(df: pd.DataFrame, freq: str) -> pd.DataFrame:
-    """One row per non-empty time bucket: dominant topic, message count, avg sentiment."""
+    """One row per non-empty time bucket: dominant topic, message count, avg sentiment.
+
+    Dominant topic prefers the strongest non-"Other" topic in the bucket, only
+    falling back to "Other" if the bucket has no other signal at all. "Other"
+    is a generic catch-all (greetings, hype, spam) that's very often the single
+    largest bucket by plain plurality — sometimes barely over a third of
+    messages — so using a plain mode() lets "Other" win almost every bucket and
+    swallows real topic shifts into one giant merged segment. Excluding it from
+    the vote (except as a last resort) surfaces the topic that's actually
+    distinctive about that window instead."""
     ts = df.dropna(subset=["timestamp"]).sort_values("timestamp")
     if ts.empty:
         return pd.DataFrame()
@@ -1540,8 +1781,11 @@ def _bucket_topics(df: pd.DataFrame, freq: str) -> pd.DataFrame:
     for bucket_start, sub in ts.set_index("timestamp").groupby(pd.Grouper(freq=freq)):
         if len(sub) == 0:
             continue
-        mode = sub["topic"].mode()
-        dominant = mode.iloc[0] if not mode.empty else OTHER_TOPIC
+        non_other = sub[sub["topic"] != OTHER_TOPIC]
+        if len(non_other) > 0:
+            dominant = non_other["topic"].mode().iloc[0]
+        else:
+            dominant = OTHER_TOPIC
         rows.append({
             "bucket_start": bucket_start,
             "dominant_topic": dominant,
@@ -1689,8 +1933,14 @@ def render_dashboard():
     video_id = st.session_state.get("video_id", "N/A")
     scope = st.session_state.get("scope", "")
 
+    if st.session_state.get("is_default_dataset"):
+        st.info("📊 Showing the bundled default dataset — already scored, so no analysis time was "
+                "needed. Configure a source in the sidebar and click **Run Analysis** to load "
+                "different data.")
+
     st.markdown(f"## Results — `{video_id}`")
-    st.caption(f"Scope: {scope}  •  {len(df):,} total messages analyzed")
+    platform_label = st.session_state.get("platform", "YouTube")
+    st.caption(f"Platform: {platform_label}  •  Scope: {scope}  •  {len(df):,} total messages analyzed")
 
     figs_for_report = {}
 
