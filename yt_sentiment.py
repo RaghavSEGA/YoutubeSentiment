@@ -606,12 +606,30 @@ def fetch_twitch_chat(url: str, max_messages=None, max_seconds=None, progress_cb
 
     downloader = ChatDownloader()
     try:
+        # interruptible_retry=False: chat-downloader's default retry behavior
+        # tries to show an interactive "press Enter to retry now" prompt via
+        # termios, which requires a real terminal attached to stdin. On a
+        # server (Streamlit Cloud, or any non-interactive deployment) there
+        # is no such terminal, so that prompt itself crashes with
+        # termios.error — turning what should be a retryable transient error
+        # into a hard crash. With this off, it falls back to a plain
+        # (non-interactive) sleep-based backoff instead. max_attempts is also
+        # capped fairly low so a persistent failure (bad URL, Twitch-side
+        # change) fails fast with a clear message rather than retrying for
+        # minutes behind the scenes.
+        #
         # No `timeout=` passed here deliberately — that would make
         # chat-downloader apply one wall-clock deadline uniformly to both live
         # and VOD fetches. We want to know chat.status first (below) so a
         # finite VOD replay isn't cut off by a ceiling meant for endless live
         # streams; timeout is enforced by hand in the loop instead.
-        chat = downloader.get_chat(url, max_messages=max_messages, message_receive_timeout=1.0)
+        chat = downloader.get_chat(
+            url,
+            max_messages=max_messages,
+            message_receive_timeout=1.0,
+            interruptible_retry=False,
+            max_attempts=3,
+        )
     except NoChatReplay:
         raise TwitchChatError(
             "This Twitch VOD/clip doesn't have chat replay available (it may have expired, "
@@ -621,6 +639,13 @@ def fetch_twitch_chat(url: str, max_messages=None, max_seconds=None, progress_cb
         raise TwitchChatError("No Twitch channel found for that name — double check it's correct.")
     except VideoUnavailable:
         raise TwitchChatError("That Twitch VOD/clip ID doesn't exist or is unavailable.")
+    except TwitchChatError:
+        raise
+    except Exception as e:
+        # Anything else (network error, Twitch-side API/schema change, retries
+        # exhausted, etc.) — surface it as a clean message instead of letting
+        # an unrelated internal exception crash the whole app.
+        raise TwitchChatError(f"Couldn't fetch Twitch chat for that URL: {e}")
 
     is_live_status = getattr(chat, "status", None) in ("live", "upcoming")
     if max_seconds is not None:
@@ -652,6 +677,11 @@ def fetch_twitch_chat(url: str, max_messages=None, max_seconds=None, progress_cb
             )
         # if we already collected some messages before the error, keep them rather than
         # discarding a partial (and possibly large) fetch over a late-surfacing error
+    except Exception as e:
+        if not items:
+            raise TwitchChatError(f"Twitch chat fetch was interrupted: {e}")
+        # keep whatever was collected before a late/mid-stream failure rather
+        # than discarding a partial (and possibly large) fetch
     return items
 
 def load_chat_json(raw_bytes) -> list:
