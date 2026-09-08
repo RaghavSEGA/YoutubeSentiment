@@ -5,6 +5,7 @@ kaleido>=1.0.0
 pytchat
 youtube-comment-downloader
 chat-downloader
+twitch-archiver
 boto3
 anthropic
 reportlab
