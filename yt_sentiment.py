@@ -1538,23 +1538,46 @@ DEFAULT_DATASET_LABEL = "Default dataset (bundled)"
 def load_bundled_default_dataset():
     """Load the pre-scored CSV bundled alongside this script — same schema as
     the app's own CSV export (source/text/author/timestamp/sentiment_score/
-    sentiment_label/topic/badge). Returns (chat_df, comments_df); both come
-    back empty if the file is missing or fails to parse, so a bad/missing
-    bundle never blocks the app — it just falls back to the normal empty
-    state where you configure a source yourself."""
+    sentiment_label/topic/badge). Returns (chat_df, comments_df, error).
+    error is None either on success OR when the file is simply absent (the
+    normal, expected case if no bundle was deployed) — it's only set when the
+    file EXISTS but something about it is wrong, so that genuine problem is
+    distinguishable in the UI from "no bundle configured" instead of both
+    cases silently looking identical."""
     if not DEFAULT_DATASET_PATH.exists():
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), None
+
     try:
         df = pd.read_csv(DEFAULT_DATASET_PATH)
-    except Exception:
-        return pd.DataFrame(), pd.DataFrame()
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame(), (
+            f"Found {DEFAULT_DATASET_PATH.name} at {DEFAULT_DATASET_PATH.parent} but couldn't "
+            f"parse it as CSV: {e}"
+        )
+
+    required_cols = {"source", "text", "sentiment_score", "sentiment_label"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        return pd.DataFrame(), pd.DataFrame(), (
+            f"Found {DEFAULT_DATASET_PATH.name} but it's missing expected column(s): "
+            f"{', '.join(sorted(missing))}. Expected the app's own CSV export schema "
+            f"(source/text/author/timestamp/sentiment_score/sentiment_label/topic/badge)."
+        )
+
     df["text"] = df.get("text", pd.Series(dtype=str)).fillna("")
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
     source_col = df["source"] if "source" in df.columns else pd.Series(["Chat"] * len(df))
     chat_df = df[source_col == "Chat"].reset_index(drop=True)
     comments_df = df[source_col == "Comment"].reset_index(drop=True)
-    return chat_df, comments_df
+
+    if chat_df.empty and comments_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), (
+            f"Found {DEFAULT_DATASET_PATH.name} but it parsed to 0 usable rows — check that its "
+            f"'source' column contains 'Chat' and/or 'Comment' values."
+        )
+
+    return chat_df, comments_df, None
 
 if run_clicked:
     st.session_state["auto_detected_topics"] = None  # reset before load_data() may repopulate it
@@ -1576,7 +1599,9 @@ elif "data_loaded" not in st.session_state:
     # dataset instead of showing an empty "configure a source" screen. Only
     # runs once per session: after this, data_loaded is always set, so later
     # reruns (widget interactions, a real Run Analysis) never touch this again.
-    default_chat_df, default_comments_df = load_bundled_default_dataset()
+    default_chat_df, default_comments_df, default_error = load_bundled_default_dataset()
+    if default_error:
+        st.session_state["default_dataset_error"] = default_error
     if not default_chat_df.empty or not default_comments_df.empty:
         st.session_state["chat_df"] = default_chat_df
         st.session_state["comments_df"] = default_comments_df
@@ -1927,6 +1952,14 @@ def render_segments_tab(df: pd.DataFrame, video_id: str):
 def render_dashboard():
     df = combined_df()
     if df.empty:
+        default_error = st.session_state.get("default_dataset_error")
+        if default_error:
+            st.warning(f"⚠️ Tried to load the bundled default dataset but hit a problem: "
+                       f"{default_error}")
+        elif not DEFAULT_DATASET_PATH.exists():
+            st.caption(f"(No bundled default dataset found at "
+                      f"`{DEFAULT_DATASET_PATH}` — that's expected if none was deployed "
+                      f"alongside the script.)")
         st.info("No data loaded yet. Configure a source in the sidebar and click **Run Analysis**.")
         return
 
